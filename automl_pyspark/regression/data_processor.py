@@ -1016,7 +1016,33 @@ class RegressionDataProcessor:
         if target_column and target_column in data.columns and target_column not in columns_to_select:
             columns_to_select.append(target_column)
 
+
+        # Create a DataFrame with only the necessary columns
+        # If some expected raw columns are missing from the new dataset (e.g., OOT datasets),
+        # we will add them with null values after selection. This ensures that the
+        # fitted preprocessing pipeline (categorical encoders and imputers) can operate
+        # without raising "column does not exist" errors. Missing categorical columns
+        # are cast to string type to enable encoding; missing numerical columns are cast
+        # to double so that imputation works correctly.
         X = data.select(columns_to_select)
+
+        # ------------------------------------------------------------------
+        # Ensure all expected raw feature columns exist in the DataFrame
+        # When applying the preprocessing pipeline to OOT datasets, some
+        # expected columns may be missing.  Fitted stages (e.g., StringIndexer,
+        # OneHotEncoder) require their input columns to exist.  Similarly,
+        # numerical imputation expects all numeric columns to be present.  To
+        # avoid "column does not exist" errors, add any missing raw categorical
+        # or numerical columns with null values.  Categorical columns are cast
+        # to string so that encoding behaves correctly; numerical columns are
+        # cast to double so that imputation can later convert them appropriately.
+        from pyspark.sql import functions as F
+        for col_name in (categorical_vars + numerical_vars):
+            if col_name not in X.columns:
+                if col_name in categorical_vars:
+                    X = X.withColumn(col_name, F.lit(None).cast('string'))
+                else:
+                    X = X.withColumn(col_name, F.lit(None).cast('double'))
 
         # Apply target label encoding if necessary (rare for regression)
         if target_column and target_label_indexer is not None and target_column in X.columns:

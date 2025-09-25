@@ -50,58 +50,52 @@ class DataBalancer:
         """
         print(f"Analyzing class distribution for {target_column}...")
         
-        # Get class counts
-        print(f"🔍 VERIFICATION: data contains {data.count():,} rows before analyze_class_distribution")
-        
-        # DEBUG: Check target column data quality first
-        print(f"🔍 DEBUG: Checking target column '{target_column}' data quality...")
-        
-        # Check for null values in target column
+        # Persist the data to avoid repeated recomputations during multiple actions.
+        # Caching mitigates Spark's lazy evaluation issues and ensures consistent row counts.
+        data = data.cache()
+
+        # Display diagnostic information about the dataset prior to analysis
+        row_count_before = data.count()
+        print(f"🔍 VERIFICATION: data contains {row_count_before:,} rows before analyze_class_distribution")
+
+        # Check the quality of the target column (nulls, NaNs, distinct values and data type)
         from pyspark.sql.functions import col, isnan, isnull, when, count as spark_count
-        null_count = data.select(spark_count(when(isnull(col(target_column)) | isnan(col(target_column)), col(target_column)))).collect()[0][0]
+        null_count = data.select(
+            spark_count(when(isnull(col(target_column)) | isnan(col(target_column)), target_column))
+        ).collect()[0][0]
         print(f"🔍 DEBUG: Null/NaN values in target column: {null_count:,}")
-        
-        # Check distinct values in target column
-        distinct_values = data.select(target_column).distinct().collect()
-        print(f"🔍 DEBUG: Distinct values in target column: {[row[target_column] for row in distinct_values]}")
-        
-        # Check data types
+
+        distinct_values = [row[target_column] for row in data.select(target_column).distinct().collect()]
+        print(f"🔍 DEBUG: Distinct values in target column: {distinct_values}")
+
         target_dtype = dict(data.dtypes)[target_column]
         print(f"🔍 DEBUG: Target column data type: {target_dtype}")
-        
-        # Get class counts and verify consistency
-        class_counts = data.groupBy(target_column).count().collect()
-        total_count = data.count()
+
+        # For analysis, drop rows with null target values to ensure class counts sum to total_count
+        if null_count > 0:
+            data_non_null = data.filter(col(target_column).isNotNull())
+        else:
+            data_non_null = data
+
+        # Compute class counts on the non-null data
+        class_counts = data_non_null.groupBy(target_column).count().collect()
+        total_count = data_non_null.count()
         print(f"🔍 VERIFICATION: total_count contains {total_count:,} rows after analyze_class_distribution")
-        
+
         # Show detailed class counts
         print(f"🔍 DEBUG: Detailed class counts:")
         for row in class_counts:
             print(f"   Class '{row[target_column]}': {row['count']:,} rows")
-        
-        # Verify that class counts sum matches total count (should be consistent now)
-        sum_of_class_counts = sum([row['count'] for row in class_counts])
+
+        # Verify that class counts sum matches total count
+        sum_of_class_counts = sum(row['count'] for row in class_counts)
         print(f"🔍 VERIFICATION: Sum of class counts: {sum_of_class_counts:,} rows")
-        
+
         if sum_of_class_counts != total_count:
-            print(f"❌ CRITICAL ERROR: Class count sum ({sum_of_class_counts:,}) != Total count ({total_count:,})")
-            print(f"🔧 This indicates a Spark DataFrame caching/lazy evaluation issue!")
-            print(f"💡 Missing rows: {total_count - sum_of_class_counts:,} (likely null/invalid values)")
-            
-            # Additional debugging: check for rows where target is null
-            non_null_count = data.filter(col(target_column).isNotNull()).count()
-            print(f"🔍 DEBUG: Non-null target values: {non_null_count:,}")
-            print(f"🔍 DEBUG: Null target values: {total_count - non_null_count:,}")
-            
-            # POTENTIAL FIX: If the issue is null values, filter them out and recalculate
-            if non_null_count == sum_of_class_counts:
-                print(f"🔧 APPLYING FIX: Filtering out null values from dataset for analysis")
-                data = data.filter(col(target_column).isNotNull())
-                total_count = non_null_count
-                print(f"✅ Using filtered dataset with {total_count:,} non-null rows for class distribution")
-            else:
-                print(f"⚠️ WARNING: Non-null count ({non_null_count:,}) != class count sum ({sum_of_class_counts:,})")
-                print(f"⚠️ This suggests a more complex data quality issue")
+            print(
+                f"❌ CRITICAL ERROR: Class count sum ({sum_of_class_counts:,}) != Total count ({total_count:,})"
+            )
+            print("🔧 This usually indicates data quality issues beyond nulls (e.g., corrupted partitions).")
         else:
             print(f"✅ Class count verification passed: {sum_of_class_counts:,} = {total_count:,}")
         

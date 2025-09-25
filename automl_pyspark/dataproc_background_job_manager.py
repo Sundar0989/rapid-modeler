@@ -49,6 +49,19 @@ class DataprocBackgroundJobManager:
         # Monitoring thread
         self.monitoring_active = False
         self.monitoring_thread = None
+
+        # Root directory used to store job files locally.  When running in
+        # Dataproc Serverless environments, `/tmp` is the only writable
+        # filesystem.  Previously the code used hard‑coded relative paths
+        # (e.g. 'automl_jobs') which resolved to the current working
+        # directory.  This caused job status files and logs to be written
+        # outside the expected location and prevented the Streamlit UI from
+        # detecting cancellation or completion events.  Define a single
+        # `jobs_dir` attribute here and use it throughout the manager.
+        self.jobs_dir: str = "/tmp/automl_jobs"
+
+        # Ensure the jobs directory exists
+        os.makedirs(self.jobs_dir, exist_ok=True)
         
         # Start monitoring
         self.start_monitoring()
@@ -156,7 +169,9 @@ class DataprocBackgroundJobManager:
         
         # Save to local file system for compatibility with existing UI
         # Use /tmp for Cloud Run environment (writable directory)
-        jobs_dir = "/tmp/automl_jobs"
+        # Always use the configured jobs directory so files are
+        # consistently written to `/tmp/automl_jobs` in Dataproc
+        jobs_dir = self.jobs_dir
         job_dir = os.path.join(jobs_dir, job_id)
         os.makedirs(job_dir, exist_ok=True)
         with open(os.path.join(job_dir, f'{job_id}.json'), 'w') as f:
@@ -228,8 +243,10 @@ class DataprocBackgroundJobManager:
                 self.job_status[job_id]['completion_time'] = datetime.now().isoformat()
                 self.job_status[job_id]['progress'] = 100
                 
-                # Update status file
-                with open(os.path.join('automl_jobs', job_id, f'{job_id}_status.txt'), 'w') as f:
+                # Update status file in the configured jobs directory
+                status_path = os.path.join(self.jobs_dir, job_id, f'{job_id}_status.txt')
+                os.makedirs(os.path.dirname(status_path), exist_ok=True)
+                with open(status_path, 'w') as f:
                     f.write('COMPLETED')
                 
                 logger.info(f"🎉 Job {job_id} completed successfully")
@@ -252,8 +269,10 @@ class DataprocBackgroundJobManager:
                     except Exception as e:
                         logger.error(f"❌ Error organizing logs for failed job {job_id}: {e}")
                 
-                # Update status file
-                with open(os.path.join('automl_jobs', job_id, f'{job_id}_status.txt'), 'w') as f:
+                # Update status file in the configured jobs directory
+                status_path = os.path.join(self.jobs_dir, job_id, f'{job_id}_status.txt')
+                os.makedirs(os.path.dirname(status_path), exist_ok=True)
+                with open(status_path, 'w') as f:
                     f.write('FAILED')
                 
                 logger.error(f"❌ Job {job_id} failed: {dataproc_status.get('state_message', 'Unknown error')}")
@@ -383,8 +402,10 @@ class DataprocBackgroundJobManager:
                 # Remove from active jobs
                 del self.active_jobs[job_id]
                 
-                # Update status file
-                with open(os.path.join('automl_jobs', job_id, f'{job_id}_status.txt'), 'w') as f:
+                # Update status file in the configured jobs directory
+                status_path = os.path.join(self.jobs_dir, job_id, f'{job_id}_status.txt')
+                os.makedirs(os.path.dirname(status_path), exist_ok=True)
+                with open(status_path, 'w') as f:
                     f.write('CANCELLED')
                 
                 logger.info(f"✅ Job {job_id} cancelled successfully")
@@ -494,11 +515,12 @@ class DataprocBackgroundJobManager:
                 del self.active_jobs[job_id]
             
             # Remove local files
+            # Remove local files under the configured jobs directory
             job_files = [
-                os.path.join('automl_jobs', job_id, f'{job_id}.json'),
-                os.path.join('automl_jobs', job_id, f'{job_id}_status.txt'),
-                os.path.join('automl_jobs', job_id, f'{job_id}_script.py'),
-                os.path.join('automl_jobs', job_id, f'{job_id}_error.log')
+                os.path.join(self.jobs_dir, job_id, f'{job_id}.json'),
+                os.path.join(self.jobs_dir, job_id, f'{job_id}_status.txt'),
+                os.path.join(self.jobs_dir, job_id, f'{job_id}_script.py'),
+                os.path.join(self.jobs_dir, job_id, f'{job_id}_error.log')
             ]
             
             for file_path in job_files:
@@ -512,7 +534,11 @@ class DataprocBackgroundJobManager:
     
     def get_job_logs(self, job_id: str, max_lines: int = 100) -> List[str]:
         """Get recent job logs for Streamlit compatibility."""
-        log_file = os.path.join('automl_jobs', job_id, f"{job_id}_log.txt")
+        # Always look for logs in the configured jobs directory.  Previously
+        # this method used hard‑coded relative paths which made it
+        # impossible for Streamlit to detect log updates after jobs were
+        # cancelled or completed.
+        log_file = os.path.join(self.jobs_dir, job_id, f"{job_id}_log.txt")
         
         # For Dataproc Serverless jobs, try to download logs from GCS
         if job_id in self.active_jobs:
@@ -522,10 +548,12 @@ class DataprocBackgroundJobManager:
                 gcs_logs = self.dataproc_manager.get_job_logs(batch_id, max_lines)
                 if gcs_logs:
                     # Save to local file for Streamlit compatibility
-                    jobs_dir = "/tmp/automl_jobs"
-                    os.makedirs(jobs_dir, exist_ok=True)
-                    with open(log_file, 'w', encoding='utf-8') as f:
-                        f.write('\n'.join(gcs_logs))
+                    # Ensure the local job directory exists
+                    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                    # Append new logs instead of overwriting to preserve
+                    # earlier messages for subsequent calls
+                    with open(log_file, 'a', encoding='utf-8') as f:
+                        f.write('\n'.join(gcs_logs) + ('\n' if gcs_logs else ''))
                     return gcs_logs
             except Exception as e:
                 logger.warning(f"⚠️ Could not download logs from GCS: {e}")

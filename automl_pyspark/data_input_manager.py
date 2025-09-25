@@ -468,6 +468,16 @@ class DataInputManager:
         max_retries = 3
         retry_delay = 5  # seconds
         
+        # Always preserve the original table reference before any modifications.
+        # This is critical because this function may create filtered or sampled
+        # temporary tables during the feature engineering phase.  Downstream
+        # components (e.g. AutoMLClassifier) rely on `_original_table_reference`
+        # to load the full dataset after feature selection completes.  Without
+        # capturing the original table name here, the original reference can be
+        # overwritten by the sampled table name, causing the pipeline to load
+        # the sample again instead of the full dataset.
+        original_table_reference_saved = kwargs.get("_original_table_reference", table_reference)
+
         for attempt in range(max_retries):
             try:
                 project_id = kwargs.get("project_id")
@@ -529,10 +539,14 @@ class DataInputManager:
                         
                         if sample_table_ref:
                             print(f"✅ Using sample temp table for feature engineering: {sample_table_ref}")
+                            # Switch the working table_reference to the sampled table for feature engineering
                             table_reference = sample_table_ref
-                            # Store original references for later use
-                            kwargs['_original_table_reference'] = table_reference if not filtered_table_ref else table_reference
-                            kwargs['_filtered_table_reference'] = filtered_table_ref if filtered_table_ref else table_reference
+                            # Preserve the true original table reference for later use
+                            kwargs['_original_table_reference'] = original_table_reference_saved
+                            # Record which table contains any applied filters or sampling.  This allows
+                            # downstream components to understand what the sampled/filtered table is, but
+                            # without overwriting the original reference.
+                            kwargs['_filtered_table_reference'] = filtered_table_ref if filtered_table_ref else sample_table_ref
                             # Clear parameters since they're already applied in temp tables
                             row_limit = None
                             sample_percent = None

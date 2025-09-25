@@ -109,26 +109,41 @@ def _make_background_threads_daemon():
             t.daemon = True
 
 def terminate_job(spark_session=None, exit_code=0):
-    """Terminate job differently for Dataproc vs local runs."""
+    """
+    Terminate the current job gracefully.  Previously this function
+    attempted to detect Dataproc serverless execution and call
+    ``os._exit`` for immediate termination.  This behaviour caused
+    container runtime errors (e.g., `validate service connection` errors)
+    and prevented proper cleanup of resources.  The revised
+    implementation always stops the Spark session if provided and
+    calls ``sys.exit`` to allow Python to run standard shutdown hooks.
+
+    Args:
+        spark_session: Optional SparkSession to stop before exiting.
+        exit_code: Process exit code to return.
+    """
     try:
         if spark_session is not None:
             log_message(JOB_ID, "🧹 Stopping Spark session...")
             spark_session.stop()
     except Exception as e:
-        log_message(JOB_ID, f"⚠️ Error stopping Spark: {{e}}")
+        log_message(JOB_ID, f"⚠️ Error stopping Spark: {e}")
 
+    # Ensure any background threads are daemonized so they don't block exit
     _make_background_threads_daemon()
 
-    if is_dataproc():
-        # 🚨 On Dataproc: kill process immediately (skip cleanup)
-        log_message(JOB_ID, "📕 Dataproc mode: forcing container shutdown with os._exit")
+    # Flush stdio to capture final log messages
+    try:
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(exit_code)
-    else:
-        # 🏡 Local mode: exit gracefully
-        log_message(JOB_ID, "📕 Local mode: exiting gracefully with sys.exit")
-        sys.exit(exit_code)
+    except Exception:
+        pass
+
+    # Always exit gracefully.  ``sys.exit`` allows Python to perform
+    # cleanup (e.g., atexit handlers) and avoids abrupt containerd
+    # errors that occur when calling os._exit in some environments.
+    log_message(JOB_ID, "📕 Exiting job with sys.exit")
+    sys.exit(exit_code)
 
 # Set up signal handler for clean termination (using template approach)
 signal.signal(signal.SIGTERM, lambda s, f: terminate_job(spark_session, exit_code=1))
@@ -458,26 +473,47 @@ def _make_background_threads_daemon():
             t.daemon = True
 
 def terminate_job(spark_session=None, exit_code=0):
-    """Terminate job differently for Dataproc vs local runs."""
+    """Terminate job gracefully regardless of execution environment.
+
+    In earlier versions, Dataproc Serverless runs used ``os._exit`` to
+    terminate the container immediately, bypassing Python cleanup.  This
+    abrupt termination caused runtime errors in certain containerized
+    environments (e.g. ``validate service connection: ... containerd.sock``
+    errors) and prevented orderly shutdown of Spark and other resources.
+
+    This updated implementation always calls ``sys.exit`` after stopping
+    the Spark session and marking background threads as daemons.  This
+    allows Python to perform normal cleanup while still propagating the
+    exit code.  Dataproc will detect the container exit and handle it
+    appropriately, and local runs benefit from graceful termination.
+    """
     try:
         if spark_session is not None:
             log_message(JOB_ID, "🧹 Stopping Spark session...")
-            spark_session.stop()
-    except Exception as e:
-        log_message(JOB_ID, f"⚠️ Error stopping Spark: {{e}}")
+            try:
+                spark_session.stop()
+            except Exception as e:
+                log_message(JOB_ID, f"⚠️ Error stopping Spark: {e}")
+    except Exception:
+        # Ignore errors during Spark cleanup
+        pass
 
+    # Ensure that any non-daemon background threads do not block exit
     _make_background_threads_daemon()
 
-    if is_dataproc():
-        # 🚨 On Dataproc: kill process immediately (skip cleanup)
-        log_message(JOB_ID, "📕 Dataproc mode: forcing container shutdown with os._exit")
+    # Flush stdout/stderr to ensure logs are not lost
+    try:
         sys.stdout.flush()
+    except Exception:
+        pass
+    try:
         sys.stderr.flush()
-        os._exit(exit_code)
-    else:
-        # 🏡 Local mode: exit gracefully
-        log_message(JOB_ID, "📕 Local mode: exiting gracefully with sys.exit")
-        sys.exit(exit_code)
+    except Exception:
+        pass
+
+    # Exit via sys.exit for both Dataproc and local modes
+    log_message(JOB_ID, "📕 Exiting gracefully with sys.exit")
+    sys.exit(exit_code)
 
 # ========================================================================
 # LEGACY CLEANUP FUNCTIONS (kept for compatibility)
