@@ -1,0 +1,46 @@
+# Dockerfile for AutoML API Backend
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies (subset needed for API)
+RUN pip install --no-cache-dir \
+    flask==3.0.0 \
+    google-cloud-storage==3.2.0 \
+    google-auth==2.40.3 \
+    google-cloud-dataproc==5.21.0 \
+    requests==2.32.4 \
+    pyspark==3.5.6
+
+# Copy API and related files
+COPY automl_pyspark/api_endpoints.py .
+COPY automl_pyspark/output_manager.py .
+COPY automl_pyspark/dataproc_serverless_manager.py .
+COPY automl_pyspark/config_manager.py .
+COPY automl_pyspark/config.yaml .
+COPY env.dataproc .
+
+# Create non-root user
+RUN groupadd -g 1099 apiuser && \
+    useradd -m -u 1099 -g apiuser apiuser
+
+RUN chown -R apiuser:apiuser /app
+USER apiuser
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Run API server
+CMD ["python", "api_endpoints.py"]

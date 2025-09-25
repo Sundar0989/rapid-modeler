@@ -1,0 +1,26 @@
+# Streamlit Frontend Dependencies
+# Lightweight requirements for the decoupled UI
+
+# Core Streamlit
+streamlit==1.47.1
+plotly==6.2.0
+pandas==2.3.1
+
+# API communication
+requests==2.32.4
+
+# Data visualization
+matplotlib==3.10.3
+seaborn==0.13.2
+
+# Utilities
+python-dateutil==2.9.0.post0
+pytz==2025.2
+
+# Google Cloud (for direct GCS access if needed)
+google-cloud-storage==3.2.0
+google-auth==2.40.3
+
+# Optional: For advanced visualizations
+altair==5.5.0
+pydeck==0.9.1

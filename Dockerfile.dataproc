@@ -1,0 +1,148 @@
+# Dataproc Serverless Custom Runtime - Compatible with Dataproc Serverless
+# Using Python 3.10 for compatibility with Dataproc Serverless runtime
+FROM python:3.10-slim
+
+# Install system dependencies and build tools
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    default-jdk \
+    ca-certificates \
+    ca-certificates-java \
+    openssl \
+    tini \
+    git \
+    apt-transport-https \
+    lsb-release \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Google Cloud SDK (includes gsutil) - using the official installation script
+RUN curl https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt && \
+    /opt/google-cloud-sdk/bin/gcloud config set core/disable_usage_reporting true
+
+# Update CA certificates
+RUN update-ca-certificates
+
+# Set Java environment (using default JDK)
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+ENV PATH=$JAVA_HOME/bin:/opt/google-cloud-sdk/bin:$PATH
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better caching (use dataproc requirements)
+COPY automl_pyspark/dataproc_requirements.txt ./requirements.txt
+
+# Install Python dependencies
+RUN pip install --upgrade pip setuptools wheel
+
+# Install core ML dependencies compatible with Python 3.10 and Dataproc Serverless
+RUN pip install \
+    pyspark==3.5.6 \
+    py4j==0.10.9.7 \
+    xgboost==2.1.3 \
+    scikit-learn==1.5.2 \
+    scipy==1.14.1 \
+    numpy==1.26.4 \
+    pandas==2.2.3
+
+# Copy project files first (needed for automl_pyspark installation)
+COPY . .
+
+# Install automl_pyspark package from local source
+RUN pip install -e automl_pyspark/
+
+# Install remaining requirements (excluding automl_pyspark since it's already installed)
+RUN pip install -r requirements.txt || true
+
+# Ensure streamlit is installed (for compatibility)
+RUN pip install streamlit==1.47.1
+
+# Download essential JAR files for Spark integration
+RUN mkdir -p /app/automl_pyspark/libs && \
+    cd /app/automl_pyspark/libs && \
+    # Download BigQuery connector (essential for GCS/BigQuery integration)
+    curl -L -o spark-bigquery-with-dependencies_2.13-0.36.1.jar \
+        "https://repo1.maven.org/maven2/com/google/cloud/spark/spark-bigquery-with-dependencies_2.13/0.36.1/spark-bigquery-with-dependencies_2.13-0.36.1.jar" && \
+    # Verify downloads
+    ls -la /app/automl_pyspark/libs/ && \
+    echo "✅ Downloaded essential JAR files for Spark integration"
+
+# Ensure native LightGBM is properly installed
+RUN pip install lightgbm==4.6.0 --force-reinstall
+
+# Copy sample data files to working directory
+COPY automl_pyspark/IRIS.csv /app/IRIS.csv
+COPY automl_pyspark/bank.csv /app/bank.csv
+
+# Create the dataproc user (UID 1099 as required by Dataproc Serverless)
+RUN groupadd -g 1099 dataproc && \
+    useradd -m -u 1099 -g dataproc dataproc
+
+# Create spark user directory and set permissions for Dataproc Serverless
+RUN mkdir -p /home/spark/.pip && \
+    mkdir -p /home/spark/.cache && \
+    chown -R dataproc:dataproc /home/spark && \
+    chmod -R 755 /home/spark
+
+# Set proper permissions for dataproc user
+RUN chown -R dataproc:dataproc /app
+
+# Set environment variables for Dataproc Serverless
+ENV PLATFORM_ARCH=auto
+ENV ENABLE_SYNAPSEML_LIGHTGBM=true
+ENV ENABLE_SPARK_XGBOOST=true
+ENV ENABLE_NATIVE_SPARK_ML=true
+ENV PYSPARK_PYTHON=python3
+ENV PYSPARK_DRIVER_PYTHON=python3
+ENV PYSPARK_SUBMIT_ARGS="--driver-memory 4g --executor-memory 4g pyspark-shell"
+
+# Set the GCP project ID (will be overridden by Dataproc)
+ENV GOOGLE_CLOUD_PROJECT=atus-prism-dev
+
+# Set Dataproc Serverless environment variables
+ENV ENABLE_DATAPROC_SERVERLESS=true
+ENV GCP_PROJECT_ID=atus-prism-dev
+ENV GCP_REGION=us-east1
+ENV GCP_TEMP_BUCKET=rapid_modeler_app
+ENV GCP_RESULTS_BUCKET=rapid_modeler_app
+ENV DATAPROC_SERVERLESS_ENABLED=true
+ENV DATAPROC_SPARK_VERSION=3.5
+ENV DATAPROC_RUNTIME_VERSION=1.0
+ENV DATAPROC_MAX_EXECUTORS=100
+ENV DATAPROC_MIN_EXECUTORS=2
+ENV DATAPROC_EXECUTOR_MEMORY=4g
+ENV DATAPROC_EXECUTOR_CPU=2
+
+# Set Maven and SSL environment variables
+ENV MAVEN_OPTS="-Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true"
+ENV JAVA_OPTS="-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStorePassword=changeit -Xmx4g -Xms2g"
+
+# Disable Maven downloads since we're using local JARs
+ENV DISABLE_MAVEN_DOWNLOADS=true
+
+# Set pip configuration for Dataproc Serverless
+ENV PIP_CACHE_DIR=/tmp/pip-cache
+ENV PIP_CONFIG_FILE=/tmp/pip.conf
+
+# Verify installations
+RUN python --version \
+    && java -version \
+    && python -c "import xgboost; print(f'✅ XGBoost {xgboost.__version__}')" \
+    && python -c "import pyspark; print(f'✅ PySpark {pyspark.__version__}')" \
+    && python -c "import synapse.ml; print('✅ SynapseML')" || echo "⚠️ SynapseML not available" \
+    && python -c "import streamlit; print(f'✅ Streamlit {streamlit.__version__}')" \
+    && ls -la /usr/bin/tini && echo "✅ tini is available at /usr/bin/tini"
+
+# Create additional directories that Dataproc Serverless might need
+RUN mkdir -p /tmp/spark-events && \
+    mkdir -p /var/log/spark && \
+    chown -R dataproc:dataproc /tmp/spark-events /var/log/spark && \
+    chmod 755 /tmp/spark-events /var/log/spark
+
+# Switch to dataproc user for Dataproc Serverless compatibility
+USER dataproc
+WORKDIR /app
+
+# Dataproc Serverless will override the entrypoint, so we don't set one
