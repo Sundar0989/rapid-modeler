@@ -652,7 +652,8 @@ class AutoMLClassifier:
             
             # Store metadata for later use
             self._original_where_clause = where_clause
-            # Note: _filtered_table_reference is not needed in two-phase approach
+            if '_filtered_table_reference' in metadata:
+                self._filtered_table_reference = metadata['_filtered_table_reference']
         else:
             sample_data = train_data
             print(f"📊 Using provided DataFrame for feature selection: {sample_data.count():,} rows")
@@ -685,9 +686,8 @@ class AutoMLClassifier:
         
         # Feature selection on sample
         print("\n🎯 Performing feature selection on sample data...")
-        max_features = self.config.get('max_features', 30)
-        processed_sample_with_features, selected_features = self.data_processor.select_features(
-            processed_sample, target_column, max_features
+        selected_features = self.data_processor.select_features(
+            processed_sample, target_column, self.config, selected_vars
         )
         
         # Store feature selection results
@@ -746,6 +746,7 @@ class AutoMLClassifier:
                     self._original_table_reference,
                     selected_features,
                     target_column,
+                    _filtered_table_reference=getattr(self, '_filtered_table_reference', None),
                     where_clause=getattr(self, '_original_where_clause', None)
                 )
                 
@@ -880,27 +881,38 @@ class AutoMLClassifier:
         # Detect multiclass - optimized for large BigQuery datasets
         print("🔍 Detecting number of target classes...")
         try:
-            # Since we're in fit_full() with the full dataset, use efficient class detection
-            print(f"📊 Detecting classes in full dataset ({full_data.count():,} rows)...")
-            
-            # Use groupBy approach which is efficient for BigQuery and gives us class distribution
-            class_counts = full_data.groupBy(target_column).count().collect()
-            self.num_classes = len(class_counts)
-            
-            print(f"📊 Found {self.num_classes} classes:")
-            for row in sorted(class_counts, key=lambda x: x['count'], reverse=True):
-                print(f"   - {row[target_column]}: {row['count']:,} samples")
+            # For very large datasets, use a sample to determine class count
+            if total_rows is None or total_rows > 1000000:  # If more than 1M rows or unknown size, use sampling
+                if total_rows:
+                    sample_size = min(100000, int(total_rows * 0.01))  # 1% or 100k, whichever is smaller
+                    sample_fraction = sample_size / total_rows
+                    print(f"📊 Large dataset detected ({total_rows:,} rows). Sampling {sample_size:,} rows for class detection...")
+                else:
+                    sample_fraction = 0.001  # 0.1% sample for unknown size datasets
+                    print(f"📊 Very large BigQuery dataset detected. Using 0.1% sample for class detection...")
                 
-            # Verify we have valid classes
-            if self.num_classes < 2:
-                raise ValueError(f"Invalid number of classes: {self.num_classes}. Need at least 2 classes for classification.")
+                sample_data = train_data.sample(fraction=sample_fraction, seed=42)
+                self.num_classes = sample_data.select(target_column).distinct().count()
+                print(f"📊 Class count from sample: {self.num_classes}")
+                
+                # Verify with a different approach if sample suggests binary classification
+                if self.num_classes <= 2:
+                    print("🔍 Verifying class count with aggregation approach...")
+                    # Use groupBy and count which is more efficient for BigQuery
+                    class_counts = train_data.groupBy(target_column).count().limit(10).collect()
+                    self.num_classes = len(class_counts)
+                    print(f"📊 Verified class count: {self.num_classes}")
+            else:
+                # For smaller datasets, use the original approach
+                self.num_classes = train_data.select(target_column).distinct().count()
         except Exception as e:
             print(f"⚠️ Error during class detection: {e}")
-            print("🔄 Falling back to distinct count approach...")
+            print("🔄 Falling back to groupBy approach...")
             try:
-                # Fallback: Simple distinct count
-                self.num_classes = train_data.select(target_column).distinct().count()
-                print(f"📊 Class count from distinct fallback: {self.num_classes}")
+                # Fallback: Use groupBy which is more BigQuery-friendly
+                class_counts = train_data.groupBy(target_column).count().limit(10).collect()
+                self.num_classes = len(class_counts)
+                print(f"📊 Class count from groupBy fallback: {self.num_classes}")
             except Exception as e2:
                 print(f"❌ Both methods failed: {e2}")
                 print("🔄 Assuming binary classification and proceeding...")
@@ -939,6 +951,138 @@ class AutoMLClassifier:
         print(f"📋 Final selected variables: {len(self.selected_vars)} features")
         print(f"📋 Final categorical variables: {len(self.categorical_vars)} features")
         print(f"📋 Final numerical variables: {len(self.numerical_vars)} features")
+                # Check if the method exists
+                if not hasattr(self._data_manager, 'load_full_data_after_feature_selection'):
+                    print(f"   ❌ Method 'load_full_data_after_feature_selection' not found in DataInputManager")
+                    print(f"   📊 Continuing with sampled data: {processed_data.count():,} rows")
+                else:
+                    # Load full data with selected features
+                    print(f"   🔄 Loading full dataset with selected features...")
+                    print(f"   🔍 DEBUG: _original_table_reference = {self._original_table_reference}")
+                    print(f"   🔍 DEBUG: _filtered_table_reference = {getattr(self, '_filtered_table_reference', None)}")
+                    full_data = self._data_manager.load_full_data_after_feature_selection(
+                        self._original_table_reference,
+                        top_features,
+                        target_column,
+                        _filtered_table_reference=getattr(self, '_filtered_table_reference', None),
+                        where_clause=getattr(self, '_original_where_clause', None)
+                    )
+                    
+                    print(f"   📊 Full dataset loaded: {full_data.count():,} rows")
+                    print(f"   📊 Full dataset columns: {full_data.columns}")
+                    
+                    # CRITICAL FIX: Clear any cached data before switching to full dataset
+                    print(f"   🧹 Clearing cached data before full dataset processing...")
+                    processed_data.unpersist()  # Clear the sampled data cache
+                    
+                    # Reprocess the full data with the same preprocessing steps
+                    print(f"   🔄 Reprocessing full dataset with same preprocessing...")
+                    print(f"   📊 Full data before preprocessing: {full_data.count():,} rows")
+                    
+                    # Create a copy of config with sample_fraction = 1.0 to avoid re-sampling the full data
+                    full_data_config = self.config.copy()
+                    full_data_config['sample_fraction'] = 1.0
+                    print(f"   📊 Processing full data without sampling (sample_fraction = 1.0)")
+                    
+                    full_processed_data_raw = self.data_processor.preprocess(full_data, target_column, full_data_config)[0]
+                    print(f"   📊 Full data after preprocessing: {full_processed_data_raw.count():,} rows")
+                    
+                    # CRITICAL FIX: Cache and materialize immediately to prevent lazy evaluation issues
+                    print(f"   💾 Caching and materializing full processed data...")
+                    
+                    # MEMORY OPTIMIZATION: Use MEMORY_AND_DISK for large datasets
+                    from pyspark import StorageLevel
+                    full_processed_data_raw.persist(StorageLevel.MEMORY_AND_DISK)
+                    materialized_count = full_processed_data_raw.count()  # Force materialization
+                    print(f"   ✅ Full processed data cached and materialized: {materialized_count:,} rows")
+                    print(f"   💾 Using MEMORY_AND_DISK storage for memory efficiency")
+                    
+                    # CRITICAL FIX: Capture column names immediately after caching to prevent re-computation
+                    cached_columns = full_processed_data_raw.columns
+                    print(f"   📋 Captured {len(cached_columns)} column names from cached DataFrame")
+                    
+                    # Create a stable reference to prevent any variable corruption
+                    full_processed_data = full_processed_data_raw
+                    
+                    # Create final dataset with only selected features + target to break lineage and optimize memory
+                    # CRITICAL FIX: Convert original feature names to encoded names for processed data selection
+                    # top_features contains original names, but full_processed_data has encoded names
+                    encoded_feature_names = []
+                    for feature in top_features:
+                        # Check if encoded version exists in the processed data (use cached columns to prevent re-computation)
+                        encoded_name = f"{feature}_encoded"
+                        if encoded_name in cached_columns:
+                            encoded_feature_names.append(encoded_name)
+                        elif feature in cached_columns:
+                            encoded_feature_names.append(feature)  # Use original if no encoded version
+                        else:
+                            print(f"   ⚠️ Feature {feature} not found in processed data (neither original nor encoded)")
+                    
+                    required_columns = encoded_feature_names + [target_column]
+                    print(f"   🔄 Selecting {len(encoded_feature_names)} encoded features + target from processed data")
+                    print(f"   📋 Required columns: {required_columns[:5]}{'...' if len(required_columns) > 5 else ''}")
+                    
+                    # CRITICAL DEBUG: Check row count before and after select operation
+                    print(f"   🔍 DEBUG: Verifying full_processed_data integrity...")
+                    current_count = full_processed_data.count()
+                    print(f"   🔍 DEBUG: full_processed_data before select: {current_count:,} rows")
+                    
+                    # Additional verification - check if this matches our materialized count
+                    if current_count != materialized_count:
+                        print(f"   ⚠️ WARNING: Row count mismatch! Expected {materialized_count:,}, got {current_count:,}")
+                        print(f"   🔧 Attempting to use the original cached reference...")
+                        full_processed_data = full_processed_data_raw
+                        current_count = full_processed_data.count()
+                        print(f"   🔍 DEBUG: After reference fix: {current_count:,} rows")
+                    print(f"   🔍 DEBUG: Checking if all required columns exist in processed data...")
+                    available_columns = full_processed_data.columns
+                    missing_columns = [col for col in required_columns if col not in available_columns]
+                    if missing_columns:
+                        print(f"   ❌ MISSING COLUMNS: {missing_columns}")
+                        print(f"   📋 Available columns: {available_columns}")
+                    else:
+                        print(f"   ✅ All {len(required_columns)} required columns found in processed data")
+                    
+                    full_processed_data_final = full_processed_data.select(required_columns)
+                    print(f"   🔍 DEBUG: full_processed_data_final after select: {full_processed_data_final.count():,} rows")
+                    print(f"   🔄 Created full_processed_data_final with {len(required_columns)} columns")
+                    
+                    # Update selected_vars to use encoded names for consistency with processed data
+                    self.selected_vars = encoded_feature_names
+                    print(f"   🔄 Updated selected_vars to use encoded feature names: {len(self.selected_vars)} features")
+                    
+                    # Set the final dataset to use for the rest of the pipeline
+                    final_dataset = full_processed_data_final
+                    
+                    # Cache the final dataset since it will be used multiple times in the pipeline
+                    final_dataset.cache()
+                    print(f"   💾 Cached final_dataset for efficient reuse")
+                    
+                    print(f"   ✅ Successfully switched to full dataset: {final_dataset.count():,} rows")
+                    
+            except Exception as e:
+                print(f"   ❌ Failed to switch to full dataset: {e}")
+                print(f"   📊 Continuing with sampled data: {processed_data.count():,} rows")
+                import traceback
+                traceback.print_exc()
+                # Set the final dataset to use for the rest of the pipeline
+                final_dataset = processed_data
+        else:
+            print(f"   📊 Using sampled data for training: {processed_data.count():,} rows")
+            if not hasattr(self, '_original_table_reference'):
+                print(f"   💡 Reason: No original table reference (data loaded from file?)")
+            if not hasattr(self, '_data_manager'):
+                print(f"   💡 Reason: No data manager available")
+            print(f"   💡 processed_data remains as sampled data for the rest of the pipeline")
+            # Set the final dataset to use for the rest of the pipeline
+            final_dataset = processed_data
+            # Cache the final dataset since it will be used multiple times in the pipeline
+            final_dataset.cache()
+            print(f"   💾 Cached final_dataset for efficient reuse")
+        print(f"Final selected variables: {self.selected_vars}")
+        print(f"Final categorical variables: {self.categorical_vars}")
+        print(f"Final numerical variables: {self.numerical_vars}")
+        
         # Step 3: Data splitting and scaling
         print("\n3. Data Splitting and Scaling...")
         print(f"🔍 VERIFICATION: final_dataset contains {final_dataset.count():,} rows before split_and_scale")
@@ -965,7 +1109,7 @@ class AutoMLClassifier:
         print("\n4.5. Feature Profiling for All Datasets...")
         self._perform_feature_profiling_all_datasets(
             final_dataset, oot1_scaled, oot2_scaled, 
-            self.selected_vars, target_column
+            top_features, target_column
         )
         
         # Step 4.5: Determine validation strategy (cross-validation vs train/valid/test)
@@ -978,12 +1122,12 @@ class AutoMLClassifier:
         if use_cross_validation:
             print("🔄 Using cross-validation for model training and validation...")
             dataset_names = self._build_and_validate_models_cv(
-                train_scaled, train_original_scaled, valid_scaled, test_scaled, oot1_scaled, oot2_scaled, target_column, self.selected_vars
+                train_scaled, train_original_scaled, valid_scaled, test_scaled, oot1_scaled, oot2_scaled, target_column, top_features
             )
         else:
             print("📊 Using train/validation/test split for model training and validation...")
             dataset_names = self._build_and_validate_models(
-                train_scaled, train_original_scaled, valid_scaled, test_scaled, oot1_scaled, oot2_scaled, target_column, self.selected_vars
+                train_scaled, train_original_scaled, valid_scaled, test_scaled, oot1_scaled, oot2_scaled, target_column, top_features
             )
         
         # Step 6: Model selection

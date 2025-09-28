@@ -243,4 +243,27 @@ def scaled_dataframes(train, valid, test, list_of_features_to_scale, target_colu
     train = pipelineModel.transform(train).select(selectedCols)
     valid = pipelineModel.transform(valid).select(selectedCols)
     test = pipelineModel.transform(test).select(selectedCols)
-    return train, valid, test, pipelineModel 
+    return train, valid, test, pipelineModel
+
+
+def join_features_and_target(X_processed, Y):
+    """
+    Join processed features with target column.
+    
+    Args:
+        X_processed: DataFrame with processed features
+        Y: DataFrame with target column
+        
+    Returns:
+        DataFrame with features and target joined
+    """
+    from pyspark.sql.functions import monotonically_increasing_id
+    
+    # Add row IDs to both DataFrames for joining
+    X_with_id = X_processed.withColumn("row_id", monotonically_increasing_id())
+    Y_with_id = Y.withColumn("row_id", monotonically_increasing_id())
+    
+    # Join on row_id and drop the temporary column
+    joined_data = X_with_id.join(Y_with_id, "row_id").drop("row_id")
+    
+    return joined_data 

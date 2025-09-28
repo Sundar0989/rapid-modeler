@@ -597,12 +597,186 @@ class AutoMLRegressor:
             perf_config = self.config_manager.config.get('performance', {})
             timeout_minutes = perf_config.get('timeout_minutes', 0)
         
+        # Two-phase pipeline: Sample for feature selection, then full for training
+        print("\n🚀 Starting Two-Phase AutoML Pipeline...")
+        print("   Phase 1: Feature selection on sample data")
+        print("   Phase 2: Model training on full data with selected features")
+        
+        # Phase 1: Feature selection on sample data
+        selected_features, preprocessing_metadata = self.fit_sample(train_data, target_column, **kwargs)
+        
+        # Phase 2: Model training on full data
         if timeout_minutes > 0:
             print(f"⏱️ Pipeline timeout set to {timeout_minutes} minutes")
-            return self._with_timeout(self._fit_internal, timeout_minutes, train_data, target_column, oot1_data, oot2_data)
+            return self._with_timeout(self.fit_full, timeout_minutes, selected_features, preprocessing_metadata, oot1_data, oot2_data)
         else:
             print("⏱️ No timeout limit set - pipeline will run until completion")
-            return self._fit_internal(train_data, target_column, oot1_data, oot2_data)
+            return self.fit_full(selected_features, preprocessing_metadata, oot1_data, oot2_data)
+    
+    def fit_sample(self, 
+                  train_data: Union[str, DataFrame],
+                  target_column: str,
+                  **kwargs) -> tuple:
+        """
+        Phase 1: Feature selection on sample data.
+        
+        Args:
+            train_data: Training DataFrame or file path
+            target_column: Name of the target column
+            **kwargs: Additional configuration parameters
+            
+        Returns:
+            tuple: (selected_features, preprocessing_metadata)
+        """
+        print("\n📊 Phase 1: Feature Selection on Sample Data")
+        print("=" * 50)
+        
+        # Load sample data for feature engineering
+        if isinstance(train_data, str):
+            print(f"📊 Loading sample data from: {train_data}")
+            
+            # Store original table reference for later use
+            self._original_table_reference = train_data
+            
+            # Use DataInputManager for consistent data loading with intelligent sampling
+            from data_input_manager import DataInputManager
+            data_manager = DataInputManager(self.spark, self.output_dir, self.user_id)
+            self._data_manager = data_manager  # Store for later use
+            
+            sample_data, metadata = data_manager.load_data(
+                train_data, 
+                feature_engineering_phase=True,  # Enable intelligent sampling for feature engineering
+                enable_intelligent_sampling=True,
+                where_clause=kwargs.get('where_clause')
+            )
+            
+            print(f"📊 Sample data loaded: {sample_data.count():,} rows")
+            
+            # Store metadata for later use
+            self._original_where_clause = kwargs.get('where_clause')
+            # Note: _filtered_table_reference is not needed in two-phase approach
+        else:
+            sample_data = train_data
+            print(f"📊 Using provided DataFrame for feature selection: {sample_data.count():,} rows")
+        
+        # Perform feature selection on sample data
+        print(f"\n1. Data Preprocessing and Feature Engineering...")
+        self.data_processor = RegressionDataProcessor(self.spark, self.user_id, self.model_literal)
+        
+        # Store dataset info for later use
+        self.dataset_info = {
+            'total_rows': sample_data.count(),
+            'total_columns': len(sample_data.columns),
+            'dataset_size': 'large' if sample_data.count() > 100000 else 'medium'
+        }
+        print(f"📊 Sample dataset size: {self.dataset_info['dataset_size']}")
+        
+        # Preprocess sample data
+        processed_data, self.categorical_vars, self.numerical_vars = self.data_processor.preprocess(
+            sample_data, target_column, self.config, self.dataset_info
+        )
+        
+        print(f"\n2. Feature Selection on Sample Data...")
+        max_features = self.config.get('max_features', 30)
+        self.selected_vars = self.data_processor.select_features(
+            processed_data, target_column, max_features, self.dataset_info
+        )
+        
+        print(f"✅ Selected {len(self.selected_vars)} features from sample data")
+        print(f"📋 Selected features: {self.selected_vars[:5]}{'...' if len(self.selected_vars) > 5 else ''}")
+        
+        # Store preprocessing metadata for Phase 2
+        preprocessing_metadata = {
+            'target_column': target_column,
+            'categorical_vars': self.categorical_vars,
+            'numerical_vars': self.numerical_vars,
+            'dataset_info': self.dataset_info,
+            'config': self.config.copy()
+        }
+        
+        return self.selected_vars, preprocessing_metadata
+    
+    def fit_full(self, 
+                selected_features: List[str],
+                preprocessing_metadata: Dict[str, Any],
+                oot1_data: Optional[Union[str, DataFrame]] = None,
+                oot2_data: Optional[Union[str, DataFrame]] = None) -> 'AutoMLRegressor':
+        """
+        Phase 2: Model training on full data with selected features.
+        
+        Args:
+            selected_features: Features selected from Phase 1
+            preprocessing_metadata: Metadata from preprocessing in Phase 1
+            oot1_data: Out-of-time validation data 1 (optional)
+            oot2_data: Out-of-time validation data 2 (optional)
+            
+        Returns:
+            self: Fitted AutoML regressor
+        """
+        print("\n🚀 Phase 2: Model Training on Full Data")
+        print("=" * 50)
+        
+        # Restore metadata from Phase 1
+        target_column = preprocessing_metadata['target_column']
+        self.categorical_vars = preprocessing_metadata['categorical_vars']
+        self.numerical_vars = preprocessing_metadata['numerical_vars']
+        self.dataset_info = preprocessing_metadata['dataset_info']
+        self.selected_vars = selected_features
+        
+        # Load full data with selected features only
+        if hasattr(self, '_original_table_reference') and hasattr(self, '_data_manager'):
+            print(f"📊 Loading full dataset with {len(selected_features)} selected features...")
+            
+            try:
+                # Load full data with selected features
+                full_data = self._data_manager.load_full_data_after_feature_selection(
+                    self._original_table_reference,
+                    selected_features,
+                    target_column,
+                    where_clause=getattr(self, '_original_where_clause', None)
+                )
+                
+                print(f"✅ Full dataset loaded: {full_data.count():,} rows × {len(full_data.columns)} columns")
+                
+            except Exception as e:
+                print(f"❌ Failed to load full dataset: {e}")
+                raise RuntimeError(f"Cannot proceed with model training: {e}")
+        else:
+            raise RuntimeError("No original table reference available. Must call fit_sample first.")
+        
+        # Load OOT data if provided
+        if isinstance(oot1_data, str):
+            if self._is_bigquery_table(oot1_data):
+                print(f"🔗 Loading OOT1 data from BigQuery: {oot1_data}")
+                project_id = oot1_data.split('.')[0]
+                oot1_data = self.spark.read \
+                    .format("bigquery") \
+                    .option("parentProject", project_id) \
+                    .option("viewsEnabled", "true") \
+                    .option("useAvroLogicalTypes", "true") \
+                    .option("table", oot1_data) \
+                    .load()
+            else:
+                print(f"📁 Loading OOT1 data from file: {oot1_data}")
+                oot1_data = self.spark.read.csv(oot1_data, header=True, inferSchema=True)
+        
+        if isinstance(oot2_data, str):
+            if self._is_bigquery_table(oot2_data):
+                print(f"🔗 Loading OOT2 data from BigQuery: {oot2_data}")
+                project_id = oot2_data.split('.')[0]
+                oot2_data = self.spark.read \
+                    .format("bigquery") \
+                    .option("parentProject", project_id) \
+                    .option("viewsEnabled", "true") \
+                    .option("useAvroLogicalTypes", "true") \
+                    .option("table", oot2_data) \
+                    .load()
+            else:
+                print(f"📁 Loading OOT2 data from file: {oot2_data}")
+                oot2_data = self.spark.read.csv(oot2_data, header=True, inferSchema=True)
+        
+        # Continue with model training using the existing _fit_full_internal logic
+        return self._fit_full_internal(full_data, target_column, oot1_data, oot2_data)
     
     def _with_timeout(self, func, timeout_minutes: int, *args, **kwargs):
         """Execute function with timeout."""
@@ -624,9 +798,9 @@ class AutoMLRegressor:
         finally:
             signal.alarm(0)  # Ensure alarm is cancelled
     
-    def _fit_internal(self, train_data: DataFrame, target_column: str, 
-                     oot1_data: Optional[DataFrame] = None, 
-                     oot2_data: Optional[DataFrame] = None) -> 'AutoMLRegressor':
+    def _fit_full_internal(self, train_data: DataFrame, target_column: str, 
+                          oot1_data: Optional[DataFrame] = None, 
+                          oot2_data: Optional[DataFrame] = None) -> 'AutoMLRegressor':
         """Internal fit method that performs the actual training."""
         
         # Log available model types with updated configuration
@@ -694,85 +868,33 @@ class AutoMLRegressor:
         self.categorical_vars = self.data_processor.categorical_vars
         self.numerical_vars = self.data_processor.numerical_vars
         
-        # Step 1.5: Switch to full dataset for model training (if we used sampling)
-        if hasattr(self, '_original_table_reference') and hasattr(self, '_data_manager') and self.selected_vars:
-            print("\n1.5. Switching to Full Dataset for Model Training...")
-            
-            # CRITICAL FIX: Convert encoded column names back to original names for full data loading
-            # self.selected_vars contains encoded names, but we need original names to load raw data
-            original_feature_names = []
-            for col in self.selected_vars:
-                if col.endswith('_encoded'):
-                    original_name = col.replace('_encoded', '')
-                    original_feature_names.append(original_name)
-                else:
-                    original_feature_names.append(col)
-            
-            print(f"   🔄 Converting {len(self.selected_vars)} encoded features to {len(original_feature_names)} original features")
-            print(f"   📋 Original features for loading: {original_feature_names[:5]}{'...' if len(original_feature_names) > 5 else ''}")
-            
-            # Load full data with original feature names (not encoded names)
-            full_data = self._data_manager.load_full_data_after_feature_selection(
-                self._original_table_reference,
-                original_feature_names,  # Use original names instead of encoded names
-                target_column,
-                _filtered_table_reference=getattr(self, '_filtered_table_reference', None)
-            )
-            
-            # Reprocess the full data with the same preprocessing steps (matching classifier approach)
-            print("🔄 Reprocessing full dataset with same preprocessing...")
-            print(f"📊 Full data before preprocessing: {full_data.count():,} rows")
-            
-            # Create a copy of config with sample_fraction = 1.0 to avoid re-sampling the full data
-            full_data_config = self.config.copy()
-            full_data_config['sample_fraction'] = 1.0
-            print(f"📊 Processing full data without sampling (sample_fraction = 1.0)")
-            
-            # Use the same efficient approach as classifier - only preprocess training data
-            full_processed_data_raw = self.data_processor.preprocess(full_data, target_column, full_data_config)[0]
-            print(f"📊 Full data after preprocessing: {full_processed_data_raw.count():,} rows")
-            
-            # CRITICAL FIX: Cache and materialize immediately to prevent lazy evaluation issues
-            print(f"   💾 Caching and materializing full processed data...")
-            
-            # MEMORY OPTIMIZATION: Use MEMORY_AND_DISK for large datasets
-            from pyspark import StorageLevel
-            full_processed_data_raw.persist(StorageLevel.MEMORY_AND_DISK)
-            materialized_count = full_processed_data_raw.count()  # Force materialization
-            print(f"   ✅ Full processed data cached and materialized: {materialized_count:,} rows")
-            print(f"   💾 Using MEMORY_AND_DISK storage for memory efficiency")
-            
-            # CRITICAL FIX: Capture column names immediately after caching to prevent re-computation
-            cached_columns = full_processed_data_raw.columns
-            print(f"   📋 Captured {len(cached_columns)} column names from cached DataFrame")
-            
-            # Create a stable reference to prevent any variable corruption
-            full_processed_data = full_processed_data_raw
-            
-            # CRITICAL FIX: Clear any cached data before switching to full dataset
-            print(f"   🧹 Clearing cached data before full dataset processing...")
-            if 'processed_data' in locals():
-                try:
-                    processed_data.unpersist()  # Clear the sampled data cache
-                    print(f"   🧹 Cleared sampled data cache")
-                except:
-                    pass
-            
-            # Set the final dataset to use for the rest of the pipeline
-            final_dataset = full_processed_data
-            
-            # Cache the final dataset since it will be used multiple times in the pipeline
-            final_dataset.cache()
-            print(f"   💾 Cached final_dataset for efficient reuse")
-            
-            print(f"✅ Successfully switched to full dataset: {final_dataset.count():,} rows")
-        else:
-            print(f"   📊 Using sampled data for training: {processed_data.count():,} rows")
-            # Set the final dataset to use for the rest of the pipeline
-            final_dataset = processed_data
-            # Cache the final dataset since it will be used multiple times in the pipeline
-            final_dataset.cache()
-            print(f"   💾 Cached final_dataset for efficient reuse")
+        # Step 1.5: Process full dataset (already loaded with selected features)
+        print("\n1.5. Processing Full Dataset for Model Training...")
+        print(f"📊 Full data already loaded: {train_data.count():,} rows × {len(train_data.columns)} columns")
+        
+        # Create a copy of config with sample_fraction = 1.0 to avoid re-sampling the full data
+        full_data_config = self.config.copy()
+        full_data_config['sample_fraction'] = 1.0
+        print(f"📊 Processing full data without sampling (sample_fraction = 1.0)")
+        
+        # Preprocess the full data (features already selected in Phase 1)
+        processed_data, _, _ = self.data_processor.preprocess(train_data, target_column, full_data_config, self.dataset_info)
+        print(f"📊 Full data after preprocessing: {processed_data.count():,} rows")
+        
+        # CRITICAL FIX: Cache and materialize immediately to prevent lazy evaluation issues
+        print(f"   💾 Caching and materializing full processed data...")
+        
+        # MEMORY OPTIMIZATION: Use MEMORY_AND_DISK for large datasets
+        from pyspark import StorageLevel
+        processed_data.persist(StorageLevel.MEMORY_AND_DISK)
+        materialized_count = processed_data.count()  # Force materialization
+        print(f"   ✅ Full processed data cached and materialized: {materialized_count:,} rows")
+        print(f"   💾 Using MEMORY_AND_DISK storage for memory efficiency")
+        
+        # Set the final dataset to use for the rest of the pipeline
+        final_dataset = processed_data
+        
+        print(f"✅ Full dataset ready for model training: {final_dataset.count():,} rows")
         
         # Copy preprocessing pipelines from DataProcessor to AutoMLRegressor
         self.char_labels = self.data_processor.char_labels

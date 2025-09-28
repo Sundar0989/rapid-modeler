@@ -127,7 +127,7 @@ def terminate_job(spark_session=None, exit_code=0):
             log_message(JOB_ID, "🧹 Stopping Spark session...")
             spark_session.stop()
     except Exception as e:
-        log_message(JOB_ID, f"⚠️ Error stopping Spark: {e}")
+        log_message(JOB_ID, f"⚠️ Error stopping Spark: {{e}}")
 
     # Ensure any background threads are daemonized so they don't block exit
     _make_background_threads_daemon()
@@ -493,7 +493,7 @@ def terminate_job(spark_session=None, exit_code=0):
             try:
                 spark_session.stop()
             except Exception as e:
-                log_message(JOB_ID, f"⚠️ Error stopping Spark: {e}")
+                log_message(JOB_ID, f"⚠️ Error stopping Spark: {{e}}")
     except Exception:
         # Ignore errors during Spark cleanup
         pass

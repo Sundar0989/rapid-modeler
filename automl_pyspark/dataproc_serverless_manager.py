@@ -443,52 +443,9 @@ class DataprocServerlessManager:
                         deps_uris.append(f"gs://{self.config['temp_bucket']}/{blob_name}")
                 job_files['dependencies'] = deps_uris
             
-            # Create requirements.txt for package installation using dataproc_requirements.txt
-            dataproc_requirements_path = os.path.join(os.path.dirname(__file__), 'dataproc_requirements.txt')
-            logger.info(f"🔍 Looking for dataproc_requirements.txt at: {dataproc_requirements_path}")
-            
-            if os.path.exists(dataproc_requirements_path):
-                with open(dataproc_requirements_path, 'r') as f:
-                    requirements_content = f.read()
-                logger.info(f"📦 Using dataproc_requirements.txt with {len(requirements_content.splitlines())} lines")
-                logger.info(f"📦 First 5 lines: {requirements_content.splitlines()[:5]}")
-            else:
-                logger.error(f"❌ dataproc_requirements.txt not found at {dataproc_requirements_path}")
-                logger.info(f"📁 Directory contents: {os.listdir(os.path.dirname(__file__))}")
-                
-                # Enhanced fallback requirements with all critical packages - Dataproc pinned versions
-                requirements_content = """# Enhanced AutoML dependencies (automl_pyspark is packaged separately)
-# Machine Learning and Explainability - pinned versions for Dataproc
-shap==0.41.0
-scipy==1.10.1
-seaborn==0.12.2
-matplotlib==3.7.5
-lightgbm==3.3.5
-xgboost==1.7.6
-
-# Data processing - pinned versions for Dataproc
-pandas==1.5.3
-numpy==1.23.5
-scikit-learn==1.2.2
-optuna==3.4.0
-plotly==5.17.0
-xlsxwriter==3.0.9
-openpyxl==3.1.2
-joblib==1.3.2
-pyarrow==12.0.1
-
-# Additional dependencies can be added here
-# For example:
-# custom-package==1.0.0
-# another-package>=2.0.0
-"""
-                logger.warning("⚠️ dataproc_requirements.txt not found, using enhanced fallback requirements with all critical packages")
-            
-            requirements_blob = bucket.blob(f"automl_jobs/{job_id}/{job_id}_requirements.txt")
-            requirements_blob.upload_from_string(requirements_content, content_type='text/plain')
-            job_files['requirements'] = f"gs://{self.config['temp_bucket']}/automl_jobs/{job_id}/{job_id}_requirements.txt"
-            
-            logger.info("📦 Created requirements.txt for package installation")
+            # Skip requirements.txt upload - using pre-built Dataproc image packages
+            logger.info("📦 Skipping requirements.txt upload - using pre-built Dataproc image")
+            logger.info("ℹ️ All packages should be pre-installed in the Dataproc image")
             
             # Create main job script
             job_script = self._create_job_script(job_id, job_config, job_files, batch_id)
@@ -632,40 +589,30 @@ def main():
             .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true") \\
             .getOrCreate()
         
-        # Install required packages from requirements.txt
-        logger.info("📦 Installing required packages...")
+        # Skip package installation - use pre-built Dataproc image packages
+        logger.info("📦 Using pre-installed packages from Dataproc image...")
+        logger.info("ℹ️ Skipping runtime package installation to avoid version conflicts")
+        
+        # Verify key packages are available
         try:
-            import subprocess
-            
-            # Install packages from requirements.txt, but skip automl_pyspark (it's already packaged)
-            requirements_uri = "gs://{{temp_bucket}}/automl_jobs/{{job_id}}/{{job_id}}_requirements.txt"
-            if requirements_uri.startswith('gs://'):
-                # Download requirements.txt from GCS
-                rdd = spark.sparkContext.wholeTextFiles(requirements_uri)
-                _, requirements_content = rdd.collect()[0]
-                
-                # Filter out automl_pyspark from requirements (it's already packaged)
-                filtered_requirements = []
-                for line in requirements_content.splitlines():
-                    line = line.strip()
-                    if line and not line.startswith('#') and 'automl_pyspark' not in line:
-                        filtered_requirements.append(line)
-                
-                if filtered_requirements:
-                    # Write filtered requirements to local file
-                    with open('/tmp/requirements.txt', 'w') as f:
-                        f.write('\\n'.join(filtered_requirements))
-                    
-                    # Install packages
-                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', '/tmp/requirements.txt'])
-                    logger.info("✅ Packages installed successfully")
-                else:
-                    logger.info("ℹ️ No additional packages to install (automl_pyspark is already packaged)")
-            else:
-                logger.warning("⚠️ No requirements.txt found, using pre-installed packages")
-        except Exception as e:
-            logger.warning("⚠️ Package installation failed: " + str(e))
-            logger.info("ℹ️ Continuing with pre-installed packages")
+            import xgboost
+            logger.info(f"✅ XGBoost available: {xgboost.__version__}")
+        except ImportError:
+            logger.warning("⚠️ XGBoost not found in image")
+        
+        try:
+            import lightgbm
+            logger.info(f"✅ LightGBM available: {lightgbm.__version__}")
+        except ImportError:
+            logger.warning("⚠️ LightGBM not found in image")
+        
+        try:
+            import pandas
+            logger.info(f"✅ Pandas available: {pandas.__version__}")
+        except ImportError:
+            logger.warning("⚠️ Pandas not found in image")
+        
+        logger.info("✅ Package verification completed")
         
         # CRITICAL: Let Dataproc Serverless manage ALL networking configurations
         # Don't set spark.driver.host, spark.driver.bindAddress, or spark.master

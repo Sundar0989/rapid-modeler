@@ -906,4 +906,3 @@ def build_bigquery_query(table_ref: str, options: dict = None, is_view: bool = F
         query_parts.append(limit_part)
     
     return " ".join(query_parts)
-
